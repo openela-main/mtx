@@ -1,0 +1,231 @@
+tapeinfo: bounds check device-reported lengths when parsing SCSI responses
+
+tapeinfo trusts device-reported length fields in several SCSI response
+parsers without validating them against buffer sizes. A malformed, faulty,
+or emulated device can return oversized length values that cause
+out-of-bounds reads in RequestTapeAlert, mode_sense, ReportSerialNumber,
+and ReportIDLun. This patch adds bounds clamping and validation to all
+affected parsers.
+
+Changes:
+  - RequestTapeAlert: clamp tapealert_len to buffer size, validate
+    descriptor header and param_len before accessing data
+  - mode_sense: validate block descriptor length and page length
+    against the 255-byte buffer before computing pointers
+  - ReportCompressionPage: reject pages shorter than 12 bytes
+  - ReportConfigPage: reject pages shorter than 14 bytes
+  - ReportPartitionPage: validate page length, bounds check the
+    partition loop against actual page size
+  - ReportSerialNumber: clamp serial number length to buffer size
+  - ReportIDLun: add NULL check for SCSI_GetIDLun return value
+
+   Patch by: Paul Evans <pevans@redhat.com>
+
+--- a/tapeinfo.c	2008-08-19 11:03:43.000000000 +0100
++++ b/tapeinfo.c	2026-07-31 09:33:18.457124436 +0100
+@@ -395,6 +395,11 @@
+ 		return result;
+ 	}
+ 
++	/* Clamp to actual buffer data area — device may report total
++	 * available data exceeding our allocation length. */
++	if (tapealert_len > TAPEALERT_SIZE - 4)
++		tapealert_len = TAPEALERT_SIZE - 4;
++
+ 	/* okay, now allocate data and move the buffer over there: */
+ 	result->length = MAX_TAPE_ALERT;
+ 	result->data = xzmalloc(MAX_TAPE_ALERT); /* alloc & zero. */
+@@ -404,12 +409,23 @@
+ 
+ 	while (i < tapealert_len)
+ 	{
++		int remaining;
++		int param_len;
++
++		remaining = tapealert_len - i;
++		if (remaining < 4)
++			break;
++
++		param_len = walkptr[3];
++		if (param_len < 1 || (4 + param_len) > remaining)
++			break;
++
+ 		result_idx=(((int)walkptr[0])<<8) + walkptr[1]; /* the parameter #. */
+ 		if (result_idx > 0 && result_idx < MAX_TAPE_ALERT)
+ 		{
+ 			if (walkptr[4])
+ 			{
+-				result->data[result_idx] = 1; 
++				result->data[result_idx] = 1;
+ 			}
+ 			else
+ 			{
+@@ -425,8 +441,8 @@
+ 			FatalError("Invalid tapealert page: %d\n",result_idx);
+ 		}
+ 
+-		i = i + 4 + walkptr[3]; /* length byte! */
+-		walkptr = walkptr + 4 + walkptr[3]; /* next! */
++		i = i + 4 + param_len;
++		walkptr = walkptr + 4 + param_len;
+ 	}
+ 	return result;
+ }
+@@ -569,10 +585,24 @@
+ 	}
+ 
+ 	/* First skip past any header.... */
++	if (4 + input_buffer[3] >= 255)
++	{
++		free(input_buffer);
++		return NULL;
++	}
++
+ 	tmp = input_buffer + 4 + input_buffer[3];
+ 
+ 	/* now find out real length of page... */
+ 	pagelen = tmp[1] + 2;
++	if (pagelen > 255 - 4 - input_buffer[3])
++		pagelen = 255 - 4 - input_buffer[3];
++	if (pagelen < 2)
++	{
++		free(input_buffer);
++		return NULL;
++	}
++
+ 	retval = xmalloc(pagelen);
+ 
+ 	/* and copy our data to the new page. */
+@@ -608,6 +638,12 @@
+ 		return;  /* sorry! */
+ 	}
+ 
++	if (compression_page[1] + 2 < 12)
++	{
++		free(compression_page);
++		return;
++	}
++
+ 	/* Okay, we now have the compression page. Now print stuff from it: */
+ 	printf("DataCompEnabled: %s\n", (compression_page[2] & DCE_MASK)? "yes" : "no");
+ 	printf("DataCompCapable: %s\n", (compression_page[2] & DCC_MASK)? "yes" : "no");
+@@ -638,6 +674,12 @@
+ 	if (!config_page)
+ 		return;
+ 
++	if (config_page[1] + 2 < 14)
++	{
++		free(config_page);
++		return;
++	}
++
+ 	/* Now to print the stuff: */
+ 	printf("ActivePartition: %d\n", config_page[3]);
+ 
+@@ -675,45 +717,58 @@
+ 	if (!partition_page)
+ 		return;
+ 
+-	/* Okay, now we have either old format or new format: */
+-	num_parts = partition_page[3];
+-	max_parts = partition_page[2];
++	{
++		int pagelen = partition_page[1] + 2;
++
++		if (pagelen < 4)
++		{
++			free(partition_page);
++			return;
++		}
++
++		/* Okay, now we have either old format or new format: */
++		num_parts = partition_page[3];
++		max_parts = partition_page[2];
+ 
+-	printf("NumPartitions: %d\n", num_parts);
+-	printf("MaxPartitions: %d\n", max_parts);
++		printf("NumPartitions: %d\n", num_parts);
++		printf("MaxPartitions: %d\n", max_parts);
+ 
+-	if (!num_parts)
+-	{
+-		/* if no additional partitions, then ... */ 
+-		free(partition_page);
+-		return;
+-	}
++		if (!num_parts)
++		{
++			/* if no additional partitions, then ... */
++			free(partition_page);
++			return;
++		}
+ 
+-	/* we know we have at least one partition if we got here. Check the
+-	 * page size field. If it is 8 or below, then we are the old format....
+-	 */
++		/* we know we have at least one partition if we got here. Check the
++		 * page size field. If it is 8 or below, then we are the old format....
++		 */
+ 
+ #ifdef DEBUG_PARTITION
+-	fprintf(stderr,"partition_page[1]=%d\n",partition_page[1]);
+-	fflush(stderr);
++		fprintf(stderr,"partition_page[1]=%d\n",partition_page[1]);
++		fflush(stderr);
+ #endif
+-	if (partition_page[1]==8)
+-	{
+-		/* old-style! */
+-		printf("Partition1: %d\n",(partition_page[8]<<8)+partition_page[9]);
+-	}
+-	else
+-	{
+-		/* new-style! */
+-		for (i=0;i<=max_parts;i++)
++		if (partition_page[1]==8)
++		{
++			/* old-style! */
++			if (pagelen >= 10)
++				printf("Partition1: %d\n",(partition_page[8]<<8)+partition_page[9]);
++		}
++		else
+ 		{
++			/* new-style! */
++			for (i=0;i<=max_parts;i++)
++			{
++				if (9 + i * 2 >= pagelen)
++					break;
+ #ifdef DEBUG_PARTITION
+-			fprintf(stderr,"partition%d:[%d]%d [%d]%d\n", i, 8 + i * 2,
+-			partition_page[8+i*2]<<8, 9+i*2,partition_page[9 + i * 2]);
+-			fflush(stderr);
++				fprintf(stderr,"partition%d:[%d]%d [%d]%d\n", i, 8 + i * 2,
++				partition_page[8+i*2]<<8, 9+i*2,partition_page[9 + i * 2]);
++				fflush(stderr);
+ #endif
+-			printf("Partition%d: %d\n", i,
+-					(partition_page[8 + i * 2] << 8) + partition_page[9 + i * 2]);
++				printf("Partition%d: %d\n", i,
++						(partition_page[8 + i * 2] << 8) + partition_page[9 + i * 2]);
++			}
+ 		}
+ 	}
+ 	free(partition_page);
+@@ -752,6 +807,8 @@
+ 	the sernum field, and bytes 4 onward are the serial #. */
+ 
+ 	lim = (int)buffer[3];
++	if (lim > WILD_SER_SIZE - 4)
++		lim = WILD_SER_SIZE - 4;
+ 	bufptr = (char *)&(buffer[4]);
+ 
+ 	printf("SerialNumber: '");
+@@ -918,6 +975,8 @@
+ 	scsi_id_t *scsi_id;
+ 
+ 	scsi_id = SCSI_GetIDLun(fd);
++	if (!scsi_id)
++		return;
+ 	printf("SCSI ID: %d\nSCSI LUN: %d\n", scsi_id->id, scsi_id->lun);
+ }
+ 

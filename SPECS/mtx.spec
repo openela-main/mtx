@@ -1,6 +1,6 @@
 Name: mtx
 Version: 1.3.12
-Release: 26%{?dist}
+Release: 27%{?dist}
 Summary: SCSI media changer control program
 License: GPLv2
 Source0: http://downloads.sourceforge.net/%{name}/%{name}-%{version}.tar.gz
@@ -9,6 +9,8 @@ Patch0: %{name}-1.3.12-destdir.patch
 # http://mtx.opensource-sw.net/bugs/view.php?id=13
 # https://bugzilla.redhat.com/show_bug.cgi?id=538403
 Patch1: %{name}-1.3.12-argc.patch
+# https://redhat.catlassian.net/browse/RHEL-225106
+Patch2: RHEL-225106-mtx-tapeinfo-bounds-guard.patch
 URL: http://mtx.sourceforge.net/
 BuildRequires: make
 BuildRequires: gcc
@@ -28,8 +30,9 @@ tape at a time, you should install MTX.
 %prep
 %setup -q
 
-%patch0 -p2 -b .destdir
-%patch1 -p2 -b .argc
+%patch -P0 -p2 -b .destdir
+%patch -P1 -p2 -b .argc
+%patch -P2 -p1 -b .bounds-fixes
 
 # remove exec permission
 chmod a-x contrib/config_sgen_solaris.sh contrib/mtx-changer
@@ -53,6 +56,10 @@ make install DESTDIR=$RPM_BUILD_ROOT
 
 
 %changelog
+* Mon Aug 17 2026 Paul Evans <pevans@redhat.com> - 1.3.12-27
+- mtx: bounds check device-reported lengths when parsing SCSI responses in
+  tapeinfo (RHEL-225106)
+
 * Mon Aug 09 2021 Mohan Boddu <mboddu@redhat.com> - 1.3.12-26
 - Rebuilt for IMA sigs, glibc 2.34, aarch64 flags
   Related: rhbz#1991688
